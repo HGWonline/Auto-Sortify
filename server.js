@@ -14,7 +14,7 @@ const {
   RANDOM_CRON, PORT = 3000
 } = process.env;
 
-const API_VERSION = '2025-07'; // 최신 버전 기준
+const API_VERSION = '2024-04'; // 최신 버전 기준
 const GQL_ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
 
 // ---- 공통: Shopify GraphQL 호출
