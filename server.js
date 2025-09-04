@@ -246,5 +246,5 @@ async function ensureWebhooks(publicBaseUrl) {
 app.listen(PORT, async () => {
   console.log(`Auto Sortify running on :${PORT}`);
   // 배포 후, 한 번만 아래 호출로 웹훅 등록 (public URL로 교체):
-  // await ensureWebhooks('https://<your-public-url>');
+  await ensureWebhooks('https://auto-sortify.onrender.com');
 });
