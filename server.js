@@ -27,9 +27,20 @@ async function gql(query, variables = {}) {
     },
     body: JSON.stringify({ query, variables })
   });
+
+  // 상태 코드 확인 (200이 아니면 본문을 그대로 출력)
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`HTTP ${res.status} from Shopify: ${text}`);
+  }
+
   const json = await res.json();
-  if (json.errors) throw new Error(JSON.stringify(json.errors));
-  if (json.data?.userErrors?.length) throw new Error(JSON.stringify(json.data.userErrors));
+  if (json.errors) {
+    throw new Error('GraphQL errors: ' + JSON.stringify(json.errors));
+  }
+  if (json.data?.userErrors?.length) {
+    throw new Error('User errors: ' + JSON.stringify(json.data.userErrors));
+  }
   return json.data;
 }
 
@@ -60,6 +71,11 @@ app.post('/webhooks/inventory-levels-update', async (req, res) => {
 app.get('/run-now', async (_req, res) => {
   await runAllAutoSorts();
   res.send('done');
+});
+
+// ---- 루트 안내 페이지 (새로 추가)
+app.get('/', (_req, res) => {
+  res.send('Auto Sortify is running. Use /run-now to trigger, or wait for webhooks.');
 });
 
 // ---- (핵심) 모든 규칙 실행
