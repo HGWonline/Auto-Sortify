@@ -269,7 +269,7 @@ async function reorderToTarget(collectionId, oldOrder, newOrder) {
     const id = newOrder[i];
     const cur = pos.get(id);
     if (cur !== i) {
-      moves.push({ id, newPosition: i });
+      moves.push({ id, newPosition: String(i) });
       // simulate
       oldOrder.splice(cur, 1);
       oldOrder.splice(i, 0, id);
