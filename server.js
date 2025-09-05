@@ -69,8 +69,13 @@ app.post('/webhooks/inventory-levels-update', async (req, res) => {
 
 // ---- 수동 테스트용 엔드포인트
 app.get('/run-now', async (_req, res) => {
-  await runAllAutoSorts();
-  res.send('done');
+  try {
+    await runAllAutoSorts();
+    res.send('done');
+  } catch (e) {
+    console.error('RUN-NOW ERROR:', e);
+    res.status(500).send('Error: ' + (e?.message || e));
+  }
 });
 
 // ---- 루트 안내 페이지 (새로 추가)
