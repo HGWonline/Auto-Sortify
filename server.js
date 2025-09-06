@@ -41,6 +41,9 @@ const {
   // 부팅 시 웹훅 자동 등록 스위치 (기본 끔)
   AUTO_REGISTER_WEBHOOKS = '0',
 
+  // (신규) 최소 실행 간격(기본 5분)
+  MIN_GAP_MS = 5 * 60 * 1000,
+
   PORT = 3000
 } = process.env;
 
@@ -131,10 +134,28 @@ function verifyWebhook(req) {
 const parseIds = (csv) => (csv || '').split(',').map(s => s.trim()).filter(Boolean);
 
 const running = { discount: false, random: false, stock: false };
+const lastRunAt = { discount: 0, random: 0, stock: 0 }; // (신규) 최소 실행 간격 기록
+
 async function guardRun(kind, fn) {
+  const now = Date.now();
   if (running[kind]) { console.log(`[GUARD] ${kind} already running. skip`); return; }
+  if (now - lastRunAt[kind] < Number(MIN_GAP_MS)) {
+    const waitLeft = Math.ceil((Number(MIN_GAP_MS) - (now - lastRunAt[kind])) / 1000);
+    console.log(`[GUARD] ${kind} min gap (${waitLeft}s left). skip`);
+    return;
+  }
   running[kind] = true;
-  try { await fn(); } finally { running[kind] = false; }
+  try { await fn(); lastRunAt[kind] = Date.now(); }
+  finally { running[kind] = false; }
+}
+
+/* ===================== 컬렉션별 락 (신규) ===================== */
+const colLock = new Set();
+async function withCollectionLock(colId, work) {
+  if (colLock.has(colId)) { console.log('[LOCK] busy', colId); return; }
+  colLock.add(colId);
+  try { await work(); }
+  finally { colLock.delete(colId); }
 }
 
 /* ===================== 디바운스 스케줄러 ===================== */
@@ -187,7 +208,9 @@ app.post('/webhooks/products-update', async (req, res) => {
   const maxWaitMs  = Number(process.env.DISCOUNT_MAXWAIT_MS  || 600000);
   scheduleDebounced('discount', runDiscountSorts, debounceMs, maxWaitMs);
 });
+
 /* ===================== 수동 실행(랜덤/전체) & 루트 ===================== */
+// 랜덤만 실행 (토큰 보호)
 app.post('/run-random', async (req, res) => {
   const token = req.headers['x-trigger-token'] || req.query.key;
   if (TRIGGER_TOKEN && token !== TRIGGER_TOKEN) return res.status(401).send('unauthorized');
@@ -195,20 +218,22 @@ app.post('/run-random', async (req, res) => {
   runRandomSorts().catch(e => console.error('[RUN-RANDOM] error:', e));
 });
 
-app.get('/run-now', async (_req, res) => {
-  try {
-    res.send('started');
-    (async () => {
-      await runDiscountSorts();
-      await runRandomSorts();
-      await runHighStockSorts();
-      console.log('[RUNNOW] finished all');
-    })().catch(e => console.error('[RUNNOW] error:', e));
-  } catch (e) {
-    console.error('[RUNNOW] fatal:', e);
-    res.status(500).send('Error: ' + (e?.message || e));
-  }
+// ✅ (신규) 전체 실행을 POST + 토큰 보호로 전환
+app.post('/run-now', async (req, res) => {
+  const token = req.headers['x-trigger-token'] || req.query.key;
+  if (TRIGGER_TOKEN && token !== TRIGGER_TOKEN) return res.status(401).send('unauthorized');
+
+  res.send('started');
+  (async () => {
+    await runDiscountSorts();
+    await runRandomSorts();
+    await runHighStockSorts();
+    console.log('[RUNNOW] finished all');
+  })().catch(e => console.error('[RUNNOW] error:', e));
 });
+
+// GET /run-now 는 금지
+app.get('/run-now', (_req, res) => res.status(405).send('Use POST with token'));
 
 app.get('/', (_req, res) => {
   res.send('Auto Sortify is running. Use /run-random (POST) or wait for webhooks.');
@@ -220,10 +245,12 @@ async function runDiscountSorts() {
     const ids = parseIds(DISCOUNT_COLLECTIONS);
     console.log('[RUN] discount:', ids);
     for (const colId of ids) {
-      const ok = await ensureManualSort(colId);
-      if (!ok) { console.log('[RUN] discount->NOT FOUND', colId); continue; }
-      await sortCollectionByDiscount(colId, true);
-      console.log('[RUN] discount->done', colId);
+      await withCollectionLock(colId, async () => {
+        const ok = await ensureManualSort(colId);
+        if (!ok) { console.log('[RUN] discount->NOT FOUND', colId); return; }
+        await sortCollectionByDiscount(colId, true);
+        console.log('[RUN] discount->done', colId);
+      });
     }
   });
 }
@@ -233,10 +260,12 @@ async function runRandomSorts() {
     const ids = parseIds(RANDOM_COLLECTIONS);
     console.log('[RUN] random  :', ids);
     for (const colId of ids) {
-      const ok = await ensureManualSort(colId);
-      if (!ok) { console.log('[RUN] random->NOT FOUND', colId); continue; }
-      await shuffleCollection(colId, true);
-      console.log('[RUN] random->done', colId);
+      await withCollectionLock(colId, async () => {
+        const ok = await ensureManualSort(colId);
+        if (!ok) { console.log('[RUN] random->NOT FOUND', colId); return; }
+        await shuffleCollection(colId, true);
+        console.log('[RUN] random->done', colId);
+      });
     }
   });
 }
@@ -246,10 +275,12 @@ async function runHighStockSorts() {
     const ids = parseIds(HIGHSTOCK_COLLECTIONS);
     console.log('[RUN] highstk :', ids);
     for (const colId of ids) {
-      const ok = await ensureManualSort(colId);
-      if (!ok) { console.log('[RUN] highstk->NOT FOUND', colId); continue; }
-      await sortCollectionByStockDesc(colId, true);
-      console.log('[RUN] highstk->done', colId);
+      await withCollectionLock(colId, async () => {
+        const ok = await ensureManualSort(colId);
+        if (!ok) { console.log('[RUN] highstk->NOT FOUND', colId); return; }
+        await sortCollectionByStockDesc(colId, true);
+        console.log('[RUN] highstk->done', colId);
+      });
     }
   });
 }
@@ -419,6 +450,19 @@ try {
     catch (e) { console.error('[CRON highstk] error:', e); }
   });
 } catch (e) { console.error('[CRON] highstk schedule error:', e); }
+
+/* ===================== 헬스/디버그 (신규) ===================== */
+app.get('/healthz', (_req, res) => res.send('ok'));
+app.get('/debug', (_req, res) => {
+  res.json({
+    running,
+    lastRunAt,
+    config: {
+      DISCOUNT_COLLECTIONS, RANDOM_COLLECTIONS, HIGHSTOCK_COLLECTIONS,
+      RANDOM_CRON, HIGHSTOCK_CRON, MOVES_CHUNK, GQL_MAX_RETRIES, MIN_GAP_MS
+    }
+  });
+});
 
 /* ===================== 서버 시작 ===================== */
 app.listen(PORT, async () => {
