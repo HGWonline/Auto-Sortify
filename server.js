@@ -424,7 +424,7 @@ try {
 app.listen(PORT, async () => {
   console.log(`Auto Sortify running on :${PORT}`);
   // 필요 시 한 번만 실행해 웹훅 자동 등록:
-  // await ensureWebhooks(process.env.PUBLIC_BASE_URL);
+  await ensureWebhooks(process.env.PUBLIC_BASE_URL);
 });
 
 /* ========= (선택) 웹훅 자동 등록 ========= */
