@@ -423,31 +423,72 @@ try {
 /* ===================== 서버 시작 ===================== */
 app.listen(PORT, async () => {
   console.log(`Auto Sortify running on :${PORT}`);
-  // 필요 시 한 번만 실행해 웹훅 자동 등록:
-  await ensureWebhooks(process.env.PUBLIC_BASE_URL);
+  // 필요할 때만 잠깐 켜서 실행하세요. 성공 후엔 다시 주석 처리!
+  try {
+    if (process.env.PUBLIC_BASE_URL) {
+      await ensureWebhooks(process.env.PUBLIC_BASE_URL);
+    } else {
+      console.warn('[ensureWebhooks] PUBLIC_BASE_URL is missing. skipped.');
+    }
+  } catch (e) {
+    console.error('[ensureWebhooks] failed:', e?.message || e);
+  }
 });
 
 /* ========= (선택) 웹훅 자동 등록 ========= */
 // PUBLIC_BASE_URL 예: https://auto-sortify.onrender.com
+// ensureWebhooks: URL 타입으로 수정 + 중복확인 + 에러로그
 async function ensureWebhooks(publicBaseUrl) {
-  const m = `
-    mutation($topic:WebhookSubscriptionTopic!, $url:String!){
-      webhookSubscriptionCreate(
-        topic:$topic,
-        webhookSubscription:{ callbackUrl:$url, format:JSON }
-      ){
-        webhookSubscription{ id }
-        userErrors{ field message }
+  // 0) 현재 구독 목록
+  const q = `
+    query {
+      webhookSubscriptions(first:100){
+        edges{
+          node{
+            id
+            topic
+            endpoint{ __typename ... on WebhookHttpEndpoint { callbackUrl } }
+          }
+        }
       }
     }
   `;
-  const topics = [
-    'PRODUCTS_UPDATE',
-    'INVENTORY_LEVELS_UPDATE',
-  ];
+  const existing = await gql(q);
+  const current = new Map(
+    (existing.webhookSubscriptions?.edges || []).map(e => [e.node.topic, e.node])
+  );
+
+  // 1) 필요한 토픽
+  const topics = ['PRODUCTS_UPDATE', 'INVENTORY_LEVELS_UPDATE'];
+
+  // 2) 생성 뮤테이션 (★ url 타입을 URL! 로 변경)
+  const m = `
+    mutation CreateHook($topic: WebhookSubscriptionTopic!, $url: URL!) {
+      webhookSubscriptionCreate(
+        topic: $topic,
+        webhookSubscription: { callbackUrl: $url, format: JSON }
+      ) {
+        webhookSubscription { id }
+        userErrors { field message }
+      }
+    }
+  `;
+
   for (const t of topics) {
     const url = `${publicBaseUrl}/webhooks/${t.toLowerCase().replace(/_/g,'-')}`;
+    if (current.has(t)) {
+      const cb = current.get(t).endpoint?.callbackUrl;
+      console.log('[WEBHOOK exists]', t, '->', cb);
+      continue;
+    }
     console.log('[WEBHOOK create]', t, '->', url);
-    await gql(m, { topic: t, url });
+    const d = await gql(m, { topic: t, url });
+    const errs = d?.webhookSubscriptionCreate?.userErrors || [];
+    if (errs.length) {
+      console.error('[WEBHOOK error]', t, errs);
+    } else {
+      console.log('[WEBHOOK created]', t, d?.webhookSubscriptionCreate?.webhookSubscription?.id);
+    }
   }
 }
+
