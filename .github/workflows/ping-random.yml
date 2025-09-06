@@ -1,0 +1,50 @@
+name: Ping /run-random
+
+on:
+  # 수동 실행 버튼도 제공
+  workflow_dispatch:
+  # 30분마다 (UTC 기준)
+  schedule:
+    - cron: "*/30 * * * *"
+
+jobs:
+  call:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Call Render endpoint
+        run: |
+          set -euo pipefail
+          # 헤더 방식(권장) — 토큰에 특수문자 있어도 안전
+          http_code=$(curl -sS -o /tmp/resp.txt -w "%{http_code}" \
+            -X POST "$PING_URL" \
+            -H "x-trigger-token: $TRIGGER_TOKEN")
+          echo "HTTP $http_code"
+          echo "----- Response -----"
+          cat /tmp/resp.txt || true
+          echo "--------------------"
+          # 2xx/3xx만 성공 처리
+          if [[ "$http_code" != 2* && "$http_code" != 3* ]]; then
+            exit 1
+          fi
+        env:
+          PING_URL: https://auto-sortify.onrender.com/run-random
+          TRIGGER_TOKEN: ${{ secrets.TRIGGER_TOKEN }}
+
+      # 단순 재시도 1회(네트워크 흔들림 대비)
+      - name: Retry once on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          sleep 15
+          http_code=$(curl -sS -o /tmp/resp.txt -w "%{http_code}" \
+            -X POST "$PING_URL" \
+            -H "x-trigger-token: $TRIGGER_TOKEN")
+          echo "HTTP $http_code"
+          cat /tmp/resp.txt || true
+          if [[ "$http_code" != 2* && "$http_code" != 3* ]]; then
+            exit 1
+          fi
+        env:
+          PING_URL: https://auto-sortify.onrender.com/run-random
+          TRIGGER_TOKEN: ${{ secrets.TRIGGER_TOKEN }}
