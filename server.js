@@ -137,19 +137,56 @@ async function guardRun(kind, fn) {
   try { await fn(); } finally { running[kind] = false; }
 }
 
+/* ===================== 디바운스 스케줄러 ===================== */
+const debounceState = {
+  discount: { timer: null, firstAt: 0 },
+  stock:    { timer: null, firstAt: 0 },
+};
+
+function scheduleDebounced(kind, runFn, debounceMs, maxWaitMs) {
+  const st = debounceState[kind];
+  const now = Date.now();
+  if (!st.firstAt) st.firstAt = now;      // 폭주 시작 시간 기록
+  if (st.timer) clearTimeout(st.timer);   // 기존 타이머 취소
+
+  const elapsed = now - st.firstAt;
+  const delay   = (maxWaitMs && elapsed >= maxWaitMs) ? 0 : debounceMs;
+
+  st.timer = setTimeout(async () => {
+    const waited = ((Date.now() - st.firstAt) / 1000).toFixed(1);
+    console.log(`[DEBOUNCE ${kind}] firing after ${waited}s calm`);
+    try {
+      await runFn();
+    } catch (e) {
+      console.error(`[DEBOUNCE ${kind}] error:`, e);
+    } finally {
+      // 리셋
+      st.timer = null;
+      st.firstAt = 0;
+    }
+  }, delay);
+}
+
 /* ===================== 웹훅 ===================== */
+// 재고 변경 → 재고정렬(디바운스)
 app.post('/webhooks/inventory-levels-update', async (req, res) => {
   if (!verifyWebhook(req)) return res.status(401).send('Invalid HMAC');
   res.status(200).send('ok');
-  runHighStockSorts().catch(e => console.error('[WEBHOOK inventory] error:', e));
+
+  const debounceMs = Number(process.env.STOCK_DEBOUNCE_MS || 120000);
+  const maxWaitMs  = Number(process.env.STOCK_MAXWAIT_MS  || 600000);
+  scheduleDebounced('stock', runHighStockSorts, debounceMs, maxWaitMs);
 });
 
+// 상품/가격 변경 → 할인정렬(디바운스)
 app.post('/webhooks/products-update', async (req, res) => {
   if (!verifyWebhook(req)) return res.status(401).send('Invalid HMAC');
   res.status(200).send('ok');
-  runDiscountSorts().catch(e => console.error('[WEBHOOK products] error:', e));
-});
 
+  const debounceMs = Number(process.env.DISCOUNT_DEBOUNCE_MS || 120000);
+  const maxWaitMs  = Number(process.env.DISCOUNT_MAXWAIT_MS  || 600000);
+  scheduleDebounced('discount', runDiscountSorts, debounceMs, maxWaitMs);
+});
 /* ===================== 수동 실행(랜덤/전체) & 루트 ===================== */
 app.post('/run-random', async (req, res) => {
   const token = req.headers['x-trigger-token'] || req.query.key;
