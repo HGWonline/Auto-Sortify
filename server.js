@@ -8,8 +8,11 @@ import cron from 'node-cron';
 dotenv.config();
 const app = express();
 
-// 웹훅 HMAC 검증용: raw body 유지 (다른 라우트는 GET만 사용)
-app.use(express.raw({ type: '*/*' }));
+/* ===================== Body parsers ===================== */
+/** 웹훅은 HMAC 검증을 위해 "raw body"가 필요합니다. */
+app.use('/webhooks', express.raw({ type: '*/*' }));
+/** 그 외 라우트는 일반 JSON 파서 사용(필요 시) */
+app.use(express.json());
 
 /* ===================== ENV ===================== */
 const {
@@ -17,7 +20,7 @@ const {
   ADMIN_TOKEN,
   API_SECRET,
 
-  // CSV (콤마로 구분, 공백 없이 권장)
+  // CSV (콤마 구분, 공백 없이 권장)
   DISCOUNT_COLLECTIONS,       // 할인순 정렬 컬렉션들
   RANDOM_COLLECTIONS,         // 랜덤 정렬 컬렉션들
   HIGHSTOCK_COLLECTIONS,      // 재고 많은 순 정렬 컬렉션들
@@ -26,37 +29,87 @@ const {
   RANDOM_CRON,
   HIGHSTOCK_CRON,
 
+  // 수동 트리거 보안 토큰
+  TRIGGER_TOKEN,
+
+  // (옵션) 레이트리밋 튜닝
+  MOVES_CHUNK = 100,          // collectionReorderProducts 청크 크기(기본 100)
+  GQL_MAX_RETRIES = 8,
+  GQL_BASE_DELAY_MS = 800,
+
   PORT = 3000
 } = process.env;
 
 const API_VERSION = '2024-07';
 const GQL_ENDPOINT = `https://${SHOP}/admin/api/${API_VERSION}/graphql.json`;
 
-/* ===================== 공통: GraphQL 호출 ===================== */
-async function gql(query, variables = {}) {
-  const res = await fetch(GQL_ENDPOINT, {
-    method: 'POST',
-    headers: {
-      'X-Shopify-Access-Token': ADMIN_TOKEN,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({ query, variables })
-  });
+/* ===================== 공통: GraphQL 호출(리트라이/백오프) ===================== */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`HTTP ${res.status} from Shopify: ${text}`);
-  }
+async function gqlWithRetry(query, variables = {}) {
+  let attempt = 0;
+  let lastErr;
 
-  const json = await res.json();
-  if (json.errors) {
-    throw new Error('GraphQL errors: ' + JSON.stringify(json.errors));
+  while (attempt <= Number(GQL_MAX_RETRIES)) {
+    try {
+      const res = await fetch(GQL_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'X-Shopify-Access-Token': ADMIN_TOKEN,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ query, variables })
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`HTTP ${res.status} from Shopify: ${text}`);
+      }
+
+      const json = await res.json();
+
+      // GraphQL top-level errors
+      if (json.errors && json.errors.length) {
+        const throttled = json.errors.some(
+          (e) =>
+            e?.extensions?.code === 'THROTTLED' ||
+            /throttled/i.test(e?.message ?? '')
+        );
+        if (throttled) {
+          // 지수 백오프
+          await sleep(Number(GQL_BASE_DELAY_MS) * Math.pow(2, attempt));
+          attempt++;
+          continue;
+        }
+        throw new Error('GraphQL errors: ' + JSON.stringify(json.errors));
+      }
+
+      // data.userErrors
+      if (json.data?.userErrors?.length) {
+        throw new Error('User errors: ' + JSON.stringify(json.data.userErrors));
+      }
+
+      // (소프트 대기) 버킷이 너무 낮으면 1초 휴식
+      const throttle = json?.extensions?.cost?.throttleStatus;
+      if (throttle && typeof throttle.currentlyAvailable === 'number') {
+        if (throttle.currentlyAvailable < 10) {
+          await sleep(1000);
+        }
+      }
+
+      return json.data;
+    } catch (e) {
+      lastErr = e;
+      if (attempt >= Number(GQL_MAX_RETRIES)) break;
+      await sleep(Number(GQL_BASE_DELAY_MS) * Math.pow(2, attempt));
+      attempt++;
+    }
   }
-  if (json.data?.userErrors?.length) {
-    throw new Error('User errors: ' + JSON.stringify(json.data.userErrors));
-  }
-  return json.data;
+  throw lastErr ?? new Error('Unknown GraphQL failure');
 }
+
+// 기존 함수명과 호환
+const gql = gqlWithRetry;
 
 /* ===================== HMAC (웹훅 보안) ===================== */
 function verifyWebhook(req) {
@@ -64,7 +117,7 @@ function verifyWebhook(req) {
     const hmac = req.headers['x-shopify-hmac-sha256'];
     const digest = crypto
       .createHmac('sha256', API_SECRET)
-      .update(req.body, 'utf8')
+      .update(req.body, 'utf8')     // webhooks 라우트에서 raw buffer를 받음
       .digest('base64');
     return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(hmac || ''));
   } catch {
@@ -76,15 +129,45 @@ function verifyWebhook(req) {
 const parseIds = (csv) =>
   (csv || '').split(',').map(s => s.trim()).filter(Boolean);
 
+/* ===================== 동시 실행 가드 ===================== */
+const running = { discount: false, random: false, stock: false };
+async function guardRun(kind, fn) {
+  if (running[kind]) {
+    console.log(`[GUARD] ${kind} is already running. Skipped.`);
+    return;
+  }
+  running[kind] = true;
+  try { await fn(); }
+  finally { running[kind] = false; }
+}
+
 /* ===================== 웹훅 ===================== */
-/** 요구사항 1: 상품 정보(가격/할인가 등) 변경 시 → “할인 정렬 컬렉션만” 재정렬 */
+// 재고 변경 → 재고정렬만
+app.post('/webhooks/inventory-levels-update', async (req, res) => {
+  if (!verifyWebhook(req)) return res.status(401).send('Invalid HMAC');
+  res.status(200).send('ok');
+  runHighStockSorts().catch(e => console.error('[WEBHOOK inventory] error:', e));
+});
+
+// 상품/가격 변경 → 할인정렬만
 app.post('/webhooks/products-update', async (req, res) => {
   if (!verifyWebhook(req)) return res.status(401).send('Invalid HMAC');
   res.status(200).send('ok');
   runDiscountSorts().catch(e => console.error('[WEBHOOK products] error:', e));
 });
 
-/* ===================== 수동 실행 & 루트 ===================== */
+/* ===================== 수동 실행(랜덤 전용/전체) & 루트 ===================== */
+// 보안 토큰으로 보호된 "랜덤 정렬만" 트리거
+app.post('/run-random', async (req, res) => {
+  const token = req.headers['x-trigger-token'] || req.query.key;
+  if (TRIGGER_TOKEN && token !== TRIGGER_TOKEN) {
+    return res.status(401).send('unauthorized');
+  }
+  res.send('random started');
+  runRandomSorts().catch(e => console.error('[RUN-RANDOM] error:', e));
+});
+
+// 전체 실행 (필요 시만 사용)
 app.get('/run-now', async (_req, res) => {
   try {
     res.send('started'); // 즉시 응답
@@ -101,41 +184,47 @@ app.get('/run-now', async (_req, res) => {
 });
 
 app.get('/', (_req, res) => {
-  res.send('Auto Sortify is running. Use /run-now to trigger, or wait for product webhooks.');
+  res.send('Auto Sortify is running. Use /run-random (POST) or wait for webhooks.');
 });
 
-/* ===================== 실행 플로우 (분리) ===================== */
+/* ===================== 실행 플로우 ===================== */
 async function runDiscountSorts() {
-  const ids = parseIds(DISCOUNT_COLLECTIONS);
-  console.log('[RUN] discount:', ids);
-  for (const colId of ids) {
-    const ok = await ensureManualSort(colId);
-    if (!ok) { console.log('[RUN] discount->NOT FOUND', colId); continue; }
-    await sortCollectionByDiscount(colId, true); // 재고 0은 항상 맨 뒤
-    console.log('[RUN] discount->done', colId);
-  }
+  await guardRun('discount', async () => {
+    const ids = parseIds(DISCOUNT_COLLECTIONS);
+    console.log('[RUN] discount:', ids);
+    for (const colId of ids) {
+      const ok = await ensureManualSort(colId);
+      if (!ok) { console.log('[RUN] discount->NOT FOUND', colId); continue; }
+      await sortCollectionByDiscount(colId, true); // 재고 0은 항상 맨 뒤
+      console.log('[RUN] discount->done', colId);
+    }
+  });
 }
 
 async function runRandomSorts() {
-  const ids = parseIds(RANDOM_COLLECTIONS);
-  console.log('[RUN] random  :', ids);
-  for (const colId of ids) {
-    const ok = await ensureManualSort(colId);
-    if (!ok) { console.log('[RUN] random->NOT FOUND', colId); continue; }
-    await shuffleCollection(colId, true); // 재고 0은 항상 맨 뒤
-    console.log('[RUN] random->done', colId);
-  }
+  await guardRun('random', async () => {
+    const ids = parseIds(RANDOM_COLLECTIONS);
+    console.log('[RUN] random  :', ids);
+    for (const colId of ids) {
+      const ok = await ensureManualSort(colId);
+      if (!ok) { console.log('[RUN] random->NOT FOUND', colId); continue; }
+      await shuffleCollection(colId, true); // 재고 0은 항상 맨 뒤
+      console.log('[RUN] random->done', colId);
+    }
+  });
 }
 
 async function runHighStockSorts() {
-  const ids = parseIds(HIGHSTOCK_COLLECTIONS);
-  console.log('[RUN] highstk :', ids);
-  for (const colId of ids) {
-    const ok = await ensureManualSort(colId);
-    if (!ok) { console.log('[RUN] highstk->NOT FOUND', colId); continue; }
-    await sortCollectionByStockDesc(colId, true); // 재고 0은 항상 맨 뒤
-    console.log('[RUN] highstk->done', colId);
-  }
+  await guardRun('stock', async () => {
+    const ids = parseIds(HIGHSTOCK_COLLECTIONS);
+    console.log('[RUN] highstk :', ids);
+    for (const colId of ids) {
+      const ok = await ensureManualSort(colId);
+      if (!ok) { console.log('[RUN] highstk->NOT FOUND', colId); continue; }
+      await sortCollectionByStockDesc(colId, true); // 재고 0은 항상 맨 뒤
+      console.log('[RUN] highstk->done', colId);
+    }
+  });
 }
 
 /* ===================== 정렬 로직 ===================== */
@@ -254,7 +343,7 @@ async function sortCollectionByStockDesc(collectionId, pushOOSBottom) {
   await reorderToTarget(collectionId, list.map(p => p.id), target.map(p => p.id));
 }
 
-// 현재 순서 → 목표 순서로 이동 (MoveInput.newPosition 은 문자열!)
+// 현재 순서 → 목표 순서로 이동
 async function reorderToTarget(collectionId, oldOrder, newOrder) {
   const pos = new Map();
   oldOrder.forEach((id, i) => pos.set(id, i));
@@ -264,7 +353,7 @@ async function reorderToTarget(collectionId, oldOrder, newOrder) {
     const id = newOrder[i];
     const cur = pos.get(id);
     if (cur !== i) {
-      moves.push({ id, newPosition: String(i) }); // 중요: 문자열
+      moves.push({ id, newPosition: String(i) }); // 문자열!
       // simulate
       oldOrder.splice(cur, 1);
       oldOrder.splice(i, 0, id);
@@ -273,7 +362,7 @@ async function reorderToTarget(collectionId, oldOrder, newOrder) {
   }
   if (moves.length === 0) return;
 
-  const chunk = 250;
+  const chunk = Number(MOVES_CHUNK); // 기본 100
   for (let i = 0; i < moves.length; i += chunk) {
     const part = moves.slice(i, i + chunk);
     const m = `
@@ -295,13 +384,14 @@ async function waitJob(jobId) {
   for (let i = 0; i < 20; i++) {
     const d = await gql(q, { id: jobId });
     if (d.job?.done) return;
-    await new Promise(r => setTimeout(r, 1000));
+    await sleep(1000);
   }
 }
 
-/* ===================== 크론 (요구사항 2,3) ===================== */
-// 기본 30분(*/30 * * * *) — 환경변수로 쉽게 변경 가능
-const randomCronExpr   = RANDOM_CRON   || '*/30 * * * *';
+/* ===================== 크론 ===================== */
+// Render 무료티어는 슬립 시 tick이 멈출 수 있으니, 외부 크론(Cloudflare/GitHub Actions) 권장.
+// 일단 앱 내부에도 설정은 유지합니다.
+const randomCronExpr    = RANDOM_CRON    || '*/30 * * * *';
 const highStockCronExpr = HIGHSTOCK_CRON || '*/30 * * * *';
 
 try {
@@ -333,12 +423,12 @@ try {
 /* ===================== 서버 시작 ===================== */
 app.listen(PORT, async () => {
   console.log(`Auto Sortify running on :${PORT}`);
-  // 필요 시 한 번만 실행해 웹훅 수동 등록:
-  // await ensureWebhooks('https://auto-sortify.onrender.com');
+  // 필요 시 한 번만 실행해 웹훅 자동 등록:
+  // await ensureWebhooks(process.env.PUBLIC_BASE_URL);
 });
 
-/* ========= (선택) 필요시 사용할 수 있는 웹훅 자동 등록 함수 ========= */
-// 사용하지 않으면 삭제/주석 처리해도 됩니다.
+/* ========= (선택) 웹훅 자동 등록 ========= */
+// PUBLIC_BASE_URL 예: https://auto-sortify.onrender.com
 async function ensureWebhooks(publicBaseUrl) {
   const m = `
     mutation($topic:WebhookSubscriptionTopic!, $url:String!){
@@ -351,8 +441,13 @@ async function ensureWebhooks(publicBaseUrl) {
       }
     }
   `;
-  const topics = ['PRODUCTS_UPDATE']; // 재고 웹훅은 현재 사용하지 않음
+  const topics = [
+    'PRODUCTS_UPDATE',
+    'INVENTORY_LEVELS_UPDATE',
+  ];
   for (const t of topics) {
-    await gql(m, { topic: t, url: `${publicBaseUrl}/webhooks/${t.toLowerCase().replace(/_/g,'-')}` });
+    const url = `${publicBaseUrl}/webhooks/${t.toLowerCase().replace(/_/g,'-')}`;
+    console.log('[WEBHOOK create]', t, '->', url);
+    await gql(m, { topic: t, url });
   }
 }
