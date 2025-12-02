@@ -20,7 +20,7 @@ jobs:
             exit 1
           fi
         env:
-          PING_URL: https://auto-sortify.onrender.com/run-random
+          PING_URL: https://auto-sortify-jdda.onrender.com/run-random
           TRIGGER_TOKEN: ${{ secrets.TRIGGER_TOKEN }}
 
       # 단순 재시도 1회(네트워크 흔들림 대비)
