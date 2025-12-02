@@ -38,5 +38,5 @@ jobs:
             exit 1
           fi
         env:
-          PING_URL: https://auto-sortify.onrender.com/run-random
+          PING_URL: https://auto-sortify-jdda.onrender.com/run-random
           TRIGGER_TOKEN: ${{ secrets.TRIGGER_TOKEN }}
