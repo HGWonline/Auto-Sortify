@@ -1,0 +1,31 @@
+name: Ping /run-random (Perth 07:00–24:00)
+
+on:
+  schedule:
+    # 매일 Perth 시간(UTC+8) 기준 07:00~24:00 동안 30분 간격 실행
+    # UTC 기준: 23–16시 (서머타임 없음)
+    - cron: "0,30 23,0-16 * * *"
+  workflow_dispatch:
+
+jobs:
+  call-run-random:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Call Render /run-random
+        run: |
+          echo "Calling: ${{ secrets.PING_URL }}"
+          http_code=$(curl -sS -o /tmp/resp.txt -w "%{http_code}" \
+            -X POST "${{ secrets.PING_URL }}" \
+            -H "x-trigger-token: ${{ secrets.TRIGGER_TOKEN }}" )
+
+          echo "HTTP $http_code"
+          cat /tmp/resp.txt || true
+
+          # 2xx 아니면 실패 처리
+          if [[ "$http_code" != 2* ]]; then
+            echo "❌ Request failed with HTTP $http_code"
+            exit 1
+          fi
+
+          echo "✅ /run-random triggered successfully"
