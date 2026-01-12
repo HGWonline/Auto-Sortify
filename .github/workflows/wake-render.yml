@@ -1,0 +1,19 @@
+name: Wake Render (Perth 08:00–24:00)
+
+on:
+  schedule:
+    # Perth 08:00–24:00 → UTC 00:00–16:00
+    # 20분 간격 keep-alive
+    - cron: "*/20 0-16 * * *"
+  workflow_dispatch:
+
+jobs:
+  wake-render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Wake Render via healthz
+        run: |
+          echo "Waking Render..."
+          curl -fs https://auto-sortify-jdda.onrender.com/healthz || true
+          echo "Done."
