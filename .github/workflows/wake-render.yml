@@ -1,10 +1,10 @@
-name: Wake Render (Perth 08:00–24:00)
+name: Wake Render (Perth 08:00-24:00)
 
 on:
   schedule:
-    # Perth 08:00–24:00 → UTC 00:00–16:00
-    # 20분 간격 keep-alive
-    - cron: "*/20 0-16 * * *"
+    # Perth 08:00-24:00 -> UTC 00:00-16:00
+    # 매시 25분, 55분에 실행 (30분 간격)
+    - cron: "25,55 0-16 * * *"
   workflow_dispatch:
 
 jobs:
