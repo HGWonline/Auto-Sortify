@@ -158,17 +158,6 @@ async function runHighStockSorts() {
   });
 }
 
-/* ===================== HTTP Trigger (Python → 할인 정렬) ===================== */
-app.post('/signal/discount', async (req, res) => {
-  const token = req.headers['x-trigger-token'] || req.query.key;
-  if (TRIGGER_TOKEN && token !== TRIGGER_TOKEN) {
-    return res.status(401).send('unauthorized');
-  }
-
-  res.send('discount sort started');
-  runDiscountSorts().catch(e => console.error('[SIGNAL discount]', e));
-});
-
 /* ===================== HTTP Trigger (수동 실행) ===================== */
 app.post('/signal/discount', async (req, res) => {
   const token = req.headers['x-trigger-token'] || req.query.key;
