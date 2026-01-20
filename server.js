@@ -169,6 +169,38 @@ app.post('/signal/discount', async (req, res) => {
   runDiscountSorts().catch(e => console.error('[SIGNAL discount]', e));
 });
 
+/* ===================== HTTP Trigger (수동 실행) ===================== */
+app.post('/signal/discount', async (req, res) => {
+  const token = req.headers['x-trigger-token'] || req.query.key;
+  if (TRIGGER_TOKEN && token !== TRIGGER_TOKEN) {
+    return res.status(401).send('unauthorized');
+  }
+
+  res.send('discount sort started');
+  runDiscountSorts().catch(e => console.error('[SIGNAL discount]', e));
+});
+
+app.post('/signal/random', async (req, res) => {
+  const token = req.headers['x-trigger-token'] || req.query.key;
+  if (TRIGGER_TOKEN && token !== TRIGGER_TOKEN) {
+    return res.status(401).send('unauthorized');
+  }
+
+  res.send('random sort started');
+  runRandomSorts().catch(e => console.error('[SIGNAL random]', e));
+});
+
+app.post('/signal/stock', async (req, res) => {
+  const token = req.headers['x-trigger-token'] || req.query.key;
+  if (TRIGGER_TOKEN && token !== TRIGGER_TOKEN) {
+    return res.status(401).send('unauthorized');
+  }
+
+  res.send('highstock sort started');
+  runHighStockSorts().catch(e => console.error('[SIGNAL stock]', e));
+});
+
+
 /* ===================== Root / Health ===================== */
 app.get('/', (_req, res) => res.send('Auto Sortify running'));
 app.get('/healthz', (_req, res) => res.send('ok'));
