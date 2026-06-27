@@ -280,7 +280,7 @@ function shuffleArray(arr) {
 function discountKey(discount) {
   // 예: 0.2 → 20.0000
   // 아주 작은 소수 오차 방지
-  return Math.round(discount * 10000);
+  Math.round(discount * 100);
 }
 
 async function sortCollectionByDiscount(colId) {
