@@ -278,9 +278,9 @@ function shuffleArray(arr) {
 }
 
 function discountKey(discount) {
-  // 예: 0.2 → 20.0000
-  // 아주 작은 소수 오차 방지
-  Math.round(discount * 100);
+  // Shopify 또는 프론트에서 보이는 할인율이 반올림 기준이라면 이 방식 사용
+  // 예: 19.6% → 20, 20.4% → 20, 20.5% → 21
+  return Math.round(discount * 100);
 }
 
 async function sortCollectionByDiscount(colId) {
@@ -288,38 +288,35 @@ async function sortCollectionByDiscount(colId) {
   const inStock = list.filter(p => p.totalInventory > 0);
   const out = list.filter(p => p.totalInventory <= 0);
 
-  const withDiscount = inStock.map(p => {
+  const groups = new Map();
+
+  for (const p of inStock) {
     const discount = maxDiscount(p);
+    const key = discountKey(discount);
 
-    return {
-      product: p,
-      discount,
-      key: discountKey(discount)
-    };
-  });
-
-  // 할인율 높은 순
-  withDiscount.sort((a, b) => b.key - a.key);
-
-  // 같은 할인율 그룹 내부만 랜덤
-  const result = [];
-  let i = 0;
-
-  while (i < withDiscount.length) {
-    const currentKey = withDiscount[i].key;
-    const group = [];
-
-    while (i < withDiscount.length && withDiscount[i].key === currentKey) {
-      group.push(withDiscount[i]);
-      i++;
+    if (!groups.has(key)) {
+      groups.set(key, []);
     }
 
+    groups.get(key).push(p);
+  }
+
+  // 할인율 key를 높은 순서로 정렬
+  const sortedKeys = [...groups.keys()].sort((a, b) => b - a);
+
+  const sortedProducts = [];
+
+  for (const key of sortedKeys) {
+    const group = groups.get(key);
+
+    // 같은 할인율 그룹 내부만 랜덤
     shuffleArray(group);
-    result.push(...group);
+
+    sortedProducts.push(...group);
   }
 
   await reorder(colId, [
-    ...result.map(item => item.product.id),
+    ...sortedProducts.map(p => p.id),
     ...out.map(p => p.id)
   ]);
 }
