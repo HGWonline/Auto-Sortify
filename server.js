@@ -269,13 +269,59 @@ function maxDiscount(p) {
   return max;
 }
 
+function shuffleArray(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+function discountKey(discount) {
+  // 예: 0.2 → 20.0000
+  // 아주 작은 소수 오차 방지
+  return Math.round(discount * 10000);
+}
+
 async function sortCollectionByDiscount(colId) {
   const list = await fetchCollectionProducts(colId);
   const inStock = list.filter(p => p.totalInventory > 0);
   const out = list.filter(p => p.totalInventory <= 0);
 
-  inStock.sort((a, b) => maxDiscount(b) - maxDiscount(a));
-  await reorder(colId, [...inStock, ...out].map(p => p.id));
+  const withDiscount = inStock.map(p => {
+    const discount = maxDiscount(p);
+
+    return {
+      product: p,
+      discount,
+      key: discountKey(discount)
+    };
+  });
+
+  // 할인율 높은 순
+  withDiscount.sort((a, b) => b.key - a.key);
+
+  // 같은 할인율 그룹 내부만 랜덤
+  const result = [];
+  let i = 0;
+
+  while (i < withDiscount.length) {
+    const currentKey = withDiscount[i].key;
+    const group = [];
+
+    while (i < withDiscount.length && withDiscount[i].key === currentKey) {
+      group.push(withDiscount[i]);
+      i++;
+    }
+
+    shuffleArray(group);
+    result.push(...group);
+  }
+
+  await reorder(colId, [
+    ...result.map(item => item.product.id),
+    ...out.map(p => p.id)
+  ]);
 }
 
 async function shuffleCollection(colId) {
